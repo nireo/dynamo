@@ -43,6 +43,7 @@ type Node struct {
 	wg                sync.WaitGroup
 	lastHeartbeat     map[string]time.Time
 	heartbeatInterval time.Duration
+	hashRing          *ConsistentHashMap
 }
 
 func NewNode(id, addr string, maxPeers int) *Node {
@@ -55,6 +56,7 @@ func NewNode(id, addr string, maxPeers int) *Node {
 		closeChan:         make(chan struct{}),
 		heartbeatInterval: 7 * time.Second,
 		lastHeartbeat:     make(map[string]time.Time),
+		hashRing:          NewConsistentHashMap(124, nil), // default to 124 virtual nodes per physical node
 	}
 }
 
@@ -175,8 +177,14 @@ func (n *Node) handleGossipEvent(data map[string]DataEntry) {
 	defer n.mutex.Unlock()
 
 	for k, v := range data {
-		if existing, ok := n.Data[k]; !ok || existing.Timestamp < v.Timestamp {
-			n.Data[k] = v
+		responsibleNode := n.getResponsibleNode(k)
+		if responsibleNode == n.ID {
+			if existing, ok := n.Data[k]; !ok || existing.Timestamp < v.Timestamp {
+				n.Data[k] = v
+			}
+		} else {
+			// If this node is not responsible, forward the data
+			n.forwardData(responsibleNode, k, v.Value)
 		}
 	}
 }
@@ -202,6 +210,19 @@ func (n *Node) AddPeer(id, addr string) {
 	}
 
 	n.Peers[id] = addr
+	n.hashRing.Add(id)
+}
+
+func (n *Node) RemovePeer(id string) {
+	n.mutex.Lock()
+	defer n.mutex.Unlock()
+
+	delete(n.Peers, id)
+	n.hashRing.Remove(id)
+}
+
+func (n *Node) getResponsibleNode(key string) string {
+	return n.hashRing.Get(key)
 }
 
 func (n *Node) getRandomPeer() string {
@@ -215,11 +236,22 @@ func (n *Node) getRandomPeer() string {
 	return peers[rand.Intn(len(peers))]
 }
 
+func (n *Node) forwardData(nodeID, key, value string) {
+	// TODO: implement this
+	log.Info().Msgf("Forwarding data for key %s to node %s", key, nodeID)
+}
+
 func (n *Node) AddData(key, value string) {
-	n.mutex.Lock()
-	defer n.mutex.Unlock()
-	currentTime := time.Now().UnixNano()
-	n.Data[key] = DataEntry{Value: value, Timestamp: currentTime}
+	responsibleNode := n.getResponsibleNode(key)
+	if responsibleNode == n.ID {
+		n.mutex.Lock()
+		defer n.mutex.Unlock()
+
+		currTime := time.Now().UnixNano()
+		n.Data[key] = DataEntry{Value: value, Timestamp: currTime}
+	} else {
+		n.forwardData(responsibleNode, key, value)
+	}
 }
 
 func (n *Node) handleHeartbeat(senderID string) {
@@ -252,8 +284,13 @@ func (n *Node) sendHeartbeat(peerAddr string) {
 func (n *Node) sendGossip(peerAddr string) {
 	n.mutex.RLock()
 	event := Event{
-		Type: EventTypeHeartbeat,
-		Data: n.Data,
+		Type: EventTypeGossip,
+		Data: make(map[string]DataEntry),
+	}
+	for k, v := range n.Data {
+		if n.getResponsibleNode(k) == n.ID {
+			event.Data[k] = v
+		}
 	}
 	n.mutex.RUnlock()
 
@@ -297,6 +334,8 @@ func (n *Node) Start() error {
 		return err
 	}
 
+	n.hashRing.Add(n.ID)
+
 	n.wg.Add(3)
 	go n.listen()
 	go n.gossip()
@@ -317,6 +356,7 @@ func (n *Node) Join(bootstrapAddr string) error {
 		Type: EventTypeJoin,
 		Data: map[string]DataEntry{n.ID: {Value: n.Addr, Timestamp: time.Now().Unix()}},
 	}
+	n.hashRing.Add(n.ID)
 
 	return json.NewEncoder(conn).Encode(event)
 }

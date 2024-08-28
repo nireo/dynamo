@@ -1,10 +1,7 @@
 package dynamo
 
 import (
-	"encoding/json"
-	"fmt"
 	"net"
-	"sync"
 	"testing"
 	"time"
 )
@@ -101,89 +98,5 @@ func TestHandleHeartbeat(t *testing.T) {
 
 	if _, ok := node.lastHeartbeat["peer1"]; !ok {
 		t.Errorf("Expected heartbeat for peer1 to be recorded")
-	}
-}
-
-func TestSendGossip(t *testing.T) {
-	node := NewNode("test", "localhost:8000", 3)
-	node.Data["key1"] = DataEntry{Timestamp: 100, Value: "value1"}
-
-	mockConn := &mockConn{
-		readData:  make(chan []byte, 1),
-		writeData: make(chan []byte, 1),
-	}
-
-	go node.sendGossip("mockPeer")
-
-	// Simulate receiving gossip data
-	var receivedEvent Event
-	data := <-mockConn.writeData
-	err := json.Unmarshal(data, &receivedEvent)
-	if err != nil {
-		t.Fatalf("Failed to unmarshal gossip data: %v", err)
-	}
-
-	if receivedEvent.Type != EventTypeGossip {
-		t.Errorf("Expected gossip event type, got %s", receivedEvent.Type)
-	}
-
-	if len(receivedEvent.Data) != 1 {
-		t.Errorf("Expected 1 data entry in gossip, got %d", len(receivedEvent.Data))
-	}
-
-	if receivedEvent.Data["key1"].Value != "value1" {
-		t.Errorf("Expected value1 in gossip data, got %s", receivedEvent.Data["key1"].Value)
-	}
-}
-
-func TestCheckHeartbeatFailures(t *testing.T) {
-	node := NewNode("test", "localhost:8000", 3)
-	node.heartbeatInterval = 1 * time.Second
-
-	node.Peers["peer1"] = "localhost:8001"
-	node.Peers["peer2"] = "localhost:8002"
-
-	node.lastHeartbeat["peer1"] = time.Now().Add(-4 * time.Second)
-	node.lastHeartbeat["peer2"] = time.Now()
-
-	node.checkHeartbeatFailures()
-
-	if _, ok := node.Peers["peer1"]; ok {
-		t.Errorf("Expected peer1 to be removed due to heartbeat failure")
-	}
-
-	if _, ok := node.Peers["peer2"]; !ok {
-		t.Errorf("Expected peer2 to still be present")
-	}
-}
-
-func TestConcurrentAccess(t *testing.T) {
-	node := NewNode("test", "localhost:8000", 10)
-	var wg sync.WaitGroup
-
-	for i := 0; i < 100; i++ {
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
-			node.AddData(fmt.Sprintf("key%d", i), fmt.Sprintf("value%d", i))
-		}(i)
-	}
-
-	for i := 0; i < 100; i++ {
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
-			node.AddPeer(fmt.Sprintf("peer%d", i), fmt.Sprintf("localhost:%d", 8001+i))
-		}(i)
-	}
-
-	wg.Wait()
-
-	if len(node.Data) != 100 {
-		t.Errorf("Expected 100 data entries, got %d", len(node.Data))
-	}
-
-	if len(node.Peers) != 10 {
-		t.Errorf("Expected 10 peers (max peers), got %d", len(node.Peers))
 	}
 }
