@@ -7,23 +7,46 @@ import (
 	"time"
 )
 
+type mockStorageValue struct {
+	value   []byte
+	version uint64
+}
+
 type MockStorage struct {
-	data map[string][]byte
+	data map[string]mockStorageValue
 }
 
 func NewMockStorage() *MockStorage {
-	return &MockStorage{data: make(map[string][]byte)}
+	return &MockStorage{data: make(map[string]mockStorageValue)}
 }
 
 func (m *MockStorage) Get(key []byte) ([]byte, error) {
 	if val, ok := m.data[string(key)]; ok {
-		return val, nil
+		return val.value, nil
 	}
 	return nil, nil
 }
 
 func (m *MockStorage) Put(key, value []byte) error {
-	m.data[string(key)] = value
+	m.data[string(key)] = mockStorageValue{
+		value:   value,
+		version: 0,
+	}
+	return nil
+}
+
+func (m *MockStorage) GetVersioned(key []byte) ([]byte, uint64, error) {
+	if val, ok := m.data[string(key)]; ok {
+		return val.value, val.version, nil
+	}
+	return nil, 0, nil
+}
+
+func (m *MockStorage) PutVersioned(key, value []byte, version uint64) error {
+	m.data[string(key)] = mockStorageValue{
+		value:   value,
+		version: version,
+	}
 	return nil
 }
 

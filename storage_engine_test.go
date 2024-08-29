@@ -41,3 +41,25 @@ func TestBadgerStore(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, newValue, retrievedValue)
 }
+
+func TestBadgerStoreVersioned(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "badger-test")
+	assert.NoError(t, err)
+	defer os.RemoveAll(tempDir)
+
+	store, err := NewBadgerStore(tempDir)
+	assert.NoError(t, err)
+	defer store.Close()
+
+	key := []byte("test-key")
+	value := []byte("test-value")
+
+	err = store.PutVersioned(key, value, 42)
+	assert.NoError(t, err)
+
+	val, version, err := store.GetVersioned(key)
+	assert.NoError(t, err)
+
+	assert.Equal(t, uint64(42), version)
+	assert.Equal(t, value, val)
+}

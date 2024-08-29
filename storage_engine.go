@@ -1,12 +1,31 @@
 package dynamo
 
-import "github.com/dgraph-io/badger/v3"
+import (
+	"encoding/binary"
+
+	"github.com/dgraph-io/badger/v3"
+)
 
 // StorageEngine is a common interface that implements all of the methods that are needed to store data on disk
 // or anywhere else etc.
 type StorageEngine interface {
+	// Get gets the corresponding value of a key from the data store.
 	Get(key []byte) ([]byte, error)
+
+	// Put stores a simple key-value pair into the data store.
 	Put(key, value []byte) error
+
+	// GetVersioned is an extension of the Get method where the version metadata is read from the
+	// value before returned. NOTE: That GetVersioned should only be used to read items that are
+	// inserted using PutVersioned
+	GetVersioned(key []byte) ([]byte, uint64, error)
+
+	// PutVersioned writes a given key value pair and adds a version at the start of the value that
+	// is then written into the data store. NOTE: This value should only be read by using GetVersioned
+	// otherwise this will cause problems.
+	PutVersioned(key, value []byte, version uint64) error
+
+	// Close clear out any left over resources etc if those need to be cleared
 	Close() error
 }
 
@@ -48,6 +67,27 @@ func (b *BadgerStorage) Put(key, value []byte) error {
 	return b.db.Update(func(txn *badger.Txn) error {
 		return txn.Set(key, value)
 	})
+}
+
+// GetVersioned -- see interface documentation
+func (b *BadgerStorage) GetVersioned(key []byte) ([]byte, uint64, error) {
+	val, err := b.Get(key)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	version := binary.LittleEndian.Uint64(val[:8])
+	return val[8:], version, nil
+}
+
+// PutVersioned -- see interface documentation
+func (b *BadgerStorage) PutVersioned(key, value []byte, version uint64) error {
+	newVal := make([]byte, 8)
+	binary.LittleEndian.PutUint64(newVal, version)
+
+	newVal = append(newVal, value...)
+
+	return b.Put(key, newVal)
 }
 
 // Close closes the BadgerDB instance
