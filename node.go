@@ -1,7 +1,6 @@
 package dynamo
 
 import (
-	"fmt"
 	"log"
 	"net"
 	"net/rpc"
@@ -36,6 +35,7 @@ type Config struct {
 type DynamoNode struct {
 	conf        Config
 	serf        *serf.Serf
+	serfConf    *serf.Config
 	events      chan serf.Event
 	consistent  *consistent.Consistent
 	data        map[string]string // TODO: store data on disk
@@ -82,6 +82,7 @@ func NewDynamoNode(config Config, bindAddr string, seeds []string, rpcAddr strin
 	}
 
 	node.serf = s
+	node.serfConf = serfConfig
 
 	node.rpcServer = rpc.NewServer()
 	err = node.rpcServer.Register(node)
@@ -133,16 +134,35 @@ func (n *DynamoNode) handleMemberLeave(event serf.MemberEvent) {
 }
 
 func (n *DynamoNode) Get(args *RPCArgs, reply *RPCReply) error {
-	return nil
+	owner := n.consistent.LocateKey(args.Key)
+	if owner.(MemberWrapper).Name == n.serfConf.NodeName {
+		n.mu.RLock()
+		defer n.mu.RUnlock()
+
+		val, err := n.storage.Get(args.Key)
+		if err != nil {
+			return err
+		}
+
+		reply.Value = val
+		return nil
+	}
+
+	return n.forward("DynamoNode.Get", args, reply, owner.(MemberWrapper))
 }
 
 func (n *DynamoNode) Put(args *RPCArgs, reply *RPCReply) error {
-	_, err := n.consistent.GetClosestN(args.Key, n.conf.W)
-	if err != nil {
+	owner := n.consistent.LocateKey(args.Key)
+
+	if owner.(MemberWrapper).Name == n.serfConf.NodeName {
+		n.mu.Lock()
+		defer n.mu.Unlock()
+
+		err := n.storage.Put(args.Key, args.Value)
 		return err
 	}
 
-	return fmt.Errorf("not responsible for this key")
+	return n.forward("DynamoNode.Put", args, reply, owner.(MemberWrapper))
 }
 
 func (n *DynamoNode) forward(method string, args *RPCArgs, reply *RPCReply, toSend MemberWrapper) error {
