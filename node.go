@@ -3,6 +3,8 @@ package dynamo
 import (
 	"fmt"
 	"log"
+	"net"
+	"net/rpc"
 	"sync"
 
 	"github.com/buraksezer/consistent"
@@ -32,15 +34,27 @@ type Config struct {
 }
 
 type DynamoNode struct {
-	conf       Config
-	serf       *serf.Serf
-	events     chan serf.Event
-	consistent *consistent.Consistent
-	data       map[string]string // TODO: store data on disk
-	mu         sync.RWMutex
+	conf        Config
+	serf        *serf.Serf
+	events      chan serf.Event
+	consistent  *consistent.Consistent
+	data        map[string]string // TODO: store data on disk
+	mu          sync.RWMutex
+	rpcServer   *rpc.Server
+	rpcListener net.Listener
 }
 
-func NewDynamoNode(config Config, bindAddr string, seeds []string) (*DynamoNode, error) {
+type RPCArgs struct {
+	Key   []byte
+	Value []byte
+}
+
+type RPCReply struct {
+	Value []byte
+	Error error
+}
+
+func NewDynamoNode(config Config, bindAddr string, seeds []string, rpcAddr string) (*DynamoNode, error) {
 	cfg := consistent.Config{
 		PartitionCount:    271,
 		ReplicationFactor: config.N,
@@ -69,16 +83,25 @@ func NewDynamoNode(config Config, bindAddr string, seeds []string) (*DynamoNode,
 
 	node.serf = s
 
-	// Join the cluster
+	node.rpcServer = rpc.NewServer()
+	err = node.rpcServer.Register(node)
+	if err != nil {
+		return nil, err
+	}
+
+	node.rpcListener, err = net.Listen("tcp", rpcAddr)
+	if err != nil {
+		return nil, err
+	}
+
 	_, err = s.Join(seeds, true)
 	if err != nil {
 		return nil, err
 	}
 
-	// Add ourselves to the consistent hash
 	node.consistent.Add(MemberWrapper{s.LocalMember()})
 
-	// Setup event handler
+	go node.rpcServer.Accept(node.rpcListener)
 	go node.eventHandler()
 
 	return node, nil
@@ -142,4 +165,22 @@ func (n *DynamoNode) Put(key, value string) error {
 	}
 
 	return fmt.Errorf("not responsible for this key")
+}
+
+func (n *DynamoNode) forward(method string, args *RPCArgs, reply *RPCReply, toSend MemberWrapper) error {
+	client, err := rpc.Dial("tcp", toSend.Addr.String())
+	if err != nil {
+		return err
+	}
+	defer client.Close()
+
+	return client.Call(method, args, reply)
+}
+
+func (n *DynamoNode) Close() error {
+	if err := n.serf.Leave(); err != nil {
+		return err
+	}
+
+	return n.rpcListener.Close()
 }
