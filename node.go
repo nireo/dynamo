@@ -55,8 +55,22 @@ type RPCReply struct {
 }
 
 func NewDynamoNode(config Config, bindAddr string, seeds []string, rpcAddr string) (*DynamoNode, error) {
+	partitionCount := 271
+	if len(seeds) == 0 {
+		partitionCount = 10
+	}
+
+	log.Printf("setting up node's serf on addr %s and rpc on addr %s", bindAddr, rpcAddr)
+	addr, err := net.ResolveTCPAddr("tcp", bindAddr)
+	if err != nil {
+		return nil, err
+	}
+
+	tags := make(map[string]string)
+	tags["rpc_addr"] = rpcAddr
+
 	cfg := consistent.Config{
-		PartitionCount:    271,
+		PartitionCount:    partitionCount,
 		ReplicationFactor: config.N,
 		Load:              1.25,
 		Hasher:            hasher{},
@@ -72,9 +86,11 @@ func NewDynamoNode(config Config, bindAddr string, seeds []string, rpcAddr strin
 	}
 
 	serfConfig := serf.DefaultConfig()
-	serfConfig.MemberlistConfig.BindAddr = bindAddr
+	serfConfig.MemberlistConfig.BindAddr = addr.IP.String()
+	serfConfig.MemberlistConfig.BindPort = addr.Port
 	serfConfig.NodeName = bindAddr
 	serfConfig.EventCh = node.events
+	serfConfig.Tags = tags
 
 	s, err := serf.Create(serfConfig)
 	if err != nil {
@@ -166,7 +182,7 @@ func (n *DynamoNode) Put(args *RPCArgs, reply *RPCReply) error {
 }
 
 func (n *DynamoNode) forward(method string, args *RPCArgs, reply *RPCReply, toSend MemberWrapper) error {
-	client, err := rpc.Dial("tcp", toSend.Addr.String())
+	client, err := rpc.Dial("tcp", toSend.Tags["rpc_addr"])
 	if err != nil {
 		return err
 	}

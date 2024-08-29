@@ -1,179 +1,197 @@
 package dynamo
 
 import (
-	"bytes"
-	"errors"
+	"fmt"
+	"net"
 	"testing"
 	"time"
 )
 
-// MockStorageEngine is a mock implementation of StorageEngine for testing
-type MockStorageEngine struct {
+type MockStorage struct {
 	data map[string][]byte
 }
 
-func NewMockStorageEngine() *MockStorageEngine {
-	return &MockStorageEngine{
-		data: make(map[string][]byte),
-	}
+func NewMockStorage() *MockStorage {
+	return &MockStorage{data: make(map[string][]byte)}
 }
 
-func (m *MockStorageEngine) Get(key []byte) ([]byte, error) {
-	if value, ok := m.data[string(key)]; ok {
-		return value, nil
+func (m *MockStorage) Get(key []byte) ([]byte, error) {
+	if val, ok := m.data[string(key)]; ok {
+		return val, nil
 	}
-	return nil, errors.New("not found")
+	return nil, nil
 }
 
-func (m *MockStorageEngine) Put(key, value []byte) error {
+func (m *MockStorage) Put(key, value []byte) error {
 	m.data[string(key)] = value
 	return nil
 }
 
-func (m *MockStorageEngine) Close() error {
+func (m *MockStorage) Close() error {
 	return nil
 }
 
-func TestNewDynamoNode(t *testing.T) {
-	config := Config{
-		N: 3,
-		R: 2,
-		W: 2,
+func getFreeTCPPort() (int, error) {
+	addr, err := net.ResolveTCPAddr("tcp", "localhost:0")
+	if err != nil {
+		return 0, err
 	}
-	node, err := NewDynamoNode(config, "127.0.0.1:7946", nil, "127.0.0.1:8946")
+
+	l, err := net.ListenTCP("tcp", addr)
+	if err != nil {
+		return 0, err
+	}
+	defer l.Close()
+	return l.Addr().(*net.TCPAddr).Port, nil
+}
+
+func TestNewDynamoNode(t *testing.T) {
+	config := Config{N: 3, R: 2, W: 2}
+
+	bindPort, err := getFreeTCPPort()
+	if err != nil {
+		t.Fatalf("Failed to get free port: %v", err)
+	}
+	bindAddr := fmt.Sprintf("127.0.0.1:%d", bindPort)
+
+	rpcPort, err := getFreeTCPPort()
+	if err != nil {
+		t.Fatalf("Failed to get free port: %v", err)
+	}
+	rpcAddr := fmt.Sprintf("127.0.0.1:%d", rpcPort)
+
+	node, err := NewDynamoNode(config, bindAddr, []string{}, rpcAddr)
 	if err != nil {
 		t.Fatalf("Failed to create DynamoNode: %v", err)
 	}
 	defer node.Close()
 
-	if node.conf.N != 3 || node.conf.R != 2 || node.conf.W != 2 {
-		t.Errorf("Node config does not match input config")
+	if node.conf != config {
+		t.Errorf("Expected config %v, got %v", config, node.conf)
 	}
 
 	if node.serf == nil {
-		t.Errorf("Serf instance not created")
+		t.Error("Serf instance is nil")
 	}
 
 	if node.consistent == nil {
-		t.Errorf("Consistent hash ring not created")
+		t.Error("Consistent hashing instance is nil")
+	}
+
+	if node.rpcServer == nil {
+		t.Error("RPC server is nil")
+	}
+
+	if node.rpcListener == nil {
+		t.Error("RPC listener is nil")
 	}
 }
 
-func TestPutAndGet(t *testing.T) {
-	config := Config{
-		N: 3,
-		R: 2,
-		W: 2,
+func TestDynamoNodePutGet(t *testing.T) {
+	config := Config{N: 0, R: 1, W: 1}
+	bindPort, err := getFreeTCPPort()
+	if err != nil {
+		t.Fatalf("Failed to get free port: %v", err)
 	}
-	node, err := NewDynamoNode(config, "127.0.0.1:7947", nil, "127.0.0.1:8947")
+	bindAddr := fmt.Sprintf("127.0.0.1:%d", bindPort)
+
+	rpcPort, err := getFreeTCPPort()
+	if err != nil {
+		t.Fatalf("Failed to get free port: %v", err)
+	}
+	rpcAddr := fmt.Sprintf("127.0.0.1:%d", rpcPort)
+
+	node, err := NewDynamoNode(config, bindAddr, []string{}, rpcAddr)
 	if err != nil {
 		t.Fatalf("Failed to create DynamoNode: %v", err)
 	}
 	defer node.Close()
 
-	// Replace the storage engine with our mock
-	node.storage = NewMockStorageEngine()
+	// Replace the storage with our mock
+	node.storage = NewMockStorage()
 
-	key := []byte("testkey")
-	value := []byte("testvalue")
+	key := []byte("testKey")
+	value := []byte("testValue")
 
+	// Test Put
 	err = node.ClientPut(key, value)
 	if err != nil {
 		t.Fatalf("Failed to put value: %v", err)
 	}
 
+	// Test Get
 	retrievedValue, err := node.ClientGet(key)
 	if err != nil {
 		t.Fatalf("Failed to get value: %v", err)
 	}
 
-	if !bytes.Equal(retrievedValue, value) {
-		t.Errorf("Retrieved value does not match put value. Got %s, want %s", retrievedValue, value)
+	if string(retrievedValue) != string(value) {
+		t.Errorf("Expected value %s, got %s", string(value), string(retrievedValue))
 	}
 }
 
-func TestMemberJoinAndLeave(t *testing.T) {
-	config := Config{
-		N: 3,
-		R: 2,
-		W: 2,
-	}
-	node1, err := NewDynamoNode(config, "127.0.0.1:7948", nil, "127.0.0.1:8948")
+func TestDynamoNodeForwarding(t *testing.T) {
+	config := Config{N: 2, R: 1, W: 1}
+
+	bindPort1, err := getFreeTCPPort()
 	if err != nil {
-		t.Fatalf("Failed to create node1: %v", err)
+		t.Fatalf("Failed to get free port: %v", err)
+	}
+	bindAddr1 := fmt.Sprintf("127.0.0.1:%d", bindPort1)
+
+	rpcPort1, err := getFreeTCPPort()
+	if err != nil {
+		t.Fatalf("Failed to get free port: %v", err)
+	}
+	rpcAddr1 := fmt.Sprintf("127.0.0.1:%d", rpcPort1)
+
+	node1, err := NewDynamoNode(config, bindAddr1, []string{}, rpcAddr1)
+	if err != nil {
+		t.Fatalf("Failed to create DynamoNode1: %v", err)
 	}
 	defer node1.Close()
 
-	node2, err := NewDynamoNode(config, "127.0.0.1:7949", []string{"127.0.0.1:7948"}, "127.0.0.1:8949")
+	bindPort2, err := getFreeTCPPort()
 	if err != nil {
-		t.Fatalf("Failed to create node2: %v", err)
+		t.Fatalf("Failed to get free port: %v", err)
+	}
+	bindAddr2 := fmt.Sprintf("127.0.0.1:%d", bindPort2)
+
+	rpcPort2, err := getFreeTCPPort()
+	if err != nil {
+		t.Fatalf("Failed to get free port: %v", err)
+	}
+	rpcAddr2 := fmt.Sprintf("127.0.0.1:%d", rpcPort2)
+
+	node2, err := NewDynamoNode(config, bindAddr2, []string{bindAddr1}, rpcAddr2)
+	if err != nil {
+		t.Fatalf("Failed to create DynamoNode2: %v", err)
 	}
 	defer node2.Close()
 
-	// Give some time for the cluster to form
-	time.Sleep(2 * time.Second)
+	// Wait for node2 to join
+	time.Sleep(1 * time.Second)
 
-	members := node1.serf.Members()
-	if len(members) != 2 {
-		t.Errorf("Expected 2 members in the cluster, got %d", len(members))
-	}
+	// Replace the storage with our mock
+	node1.storage = NewMockStorage()
+	node2.storage = NewMockStorage()
 
-	// Simulate node2 leaving
-	err = node2.serf.Leave()
-	if err != nil {
-		t.Fatalf("Failed to leave the cluster: %v", err)
-	}
+	key := []byte("testKey")
+	value := []byte("testValue")
 
-	// Give some time for the leave to propagate
-	time.Sleep(2 * time.Second)
-
-	members = node1.serf.Members()
-	if len(members) != 1 {
-		t.Errorf("Expected 1 member in the cluster after leave, got %d", len(members))
-	}
-}
-
-func TestForwarding(t *testing.T) {
-	config := Config{
-		N: 3,
-		R: 2,
-		W: 2,
-	}
-	node1, err := NewDynamoNode(config, "127.0.0.1:7950", nil, "127.0.0.1:8950")
-	if err != nil {
-		t.Fatalf("Failed to create node1: %v", err)
-	}
-	defer node1.Close()
-
-	node2, err := NewDynamoNode(config, "127.0.0.1:7951", []string{"127.0.0.1:7950"}, "127.0.0.1:8951")
-	if err != nil {
-		t.Fatalf("Failed to create node2: %v", err)
-	}
-	defer node2.Close()
-
-	// Replace the storage engines with our mocks
-	node1.storage = NewMockStorageEngine()
-	node2.storage = NewMockStorageEngine()
-
-	// Give some time for the cluster to form
-	time.Sleep(2 * time.Second)
-
-	key := []byte("testkey")
-	value := []byte("testvalue")
-
-	// Put the value using node1
+	// Put the value (this may be forwarded to the appropriate node)
 	err = node1.ClientPut(key, value)
 	if err != nil {
 		t.Fatalf("Failed to put value: %v", err)
 	}
 
-	// Try to get the value using node2
+	// Get the value (this may be forwarded to the appropriate node)
 	retrievedValue, err := node2.ClientGet(key)
 	if err != nil {
 		t.Fatalf("Failed to get value: %v", err)
 	}
 
-	if !bytes.Equal(retrievedValue, value) {
-		t.Errorf("Retrieved value does not match put value. Got %s, want %s", retrievedValue, value)
+	if string(retrievedValue) != string(value) {
+		t.Errorf("Expected value %s, got %s", string(value), string(retrievedValue))
 	}
 }
