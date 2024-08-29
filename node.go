@@ -42,6 +42,7 @@ type DynamoNode struct {
 	mu          sync.RWMutex
 	rpcServer   *rpc.Server
 	rpcListener net.Listener
+	storage     StorageEngine
 }
 
 type RPCArgs struct {
@@ -51,7 +52,6 @@ type RPCArgs struct {
 
 type RPCReply struct {
 	Value []byte
-	Error error
 }
 
 func NewDynamoNode(config Config, bindAddr string, seeds []string, rpcAddr string) (*DynamoNode, error) {
@@ -132,36 +132,14 @@ func (n *DynamoNode) handleMemberLeave(event serf.MemberEvent) {
 	}
 }
 
-func (n *DynamoNode) Get(key string) (string, error) {
-	// TODO: use owners to create read repair etc
-	// owners, err := n.consistent.GetClosestN([]byte(key), n.conf.R)
-	// if err != nil {
-	// 	return "", err
-	// }
-
-	n.mu.RLock()
-	defer n.mu.RUnlock()
-	if val, ok := n.data[key]; ok {
-		return val, nil
-	}
-	return "", fmt.Errorf("key not found")
+func (n *DynamoNode) Get(args *RPCArgs, reply *RPCReply) error {
+	return nil
 }
 
-func (n *DynamoNode) Put(key, value string) error {
-	owners, err := n.consistent.GetClosestN([]byte(key), n.conf.W)
+func (n *DynamoNode) Put(args *RPCArgs, reply *RPCReply) error {
+	_, err := n.consistent.GetClosestN(args.Key, n.conf.W)
 	if err != nil {
 		return err
-	}
-
-	// In a real implementation, you'd contact these nodes
-	// For simplicity, we'll just store locally if we're one of the owners
-	for _, owner := range owners {
-		if owner.(MemberWrapper).Name == n.serf.LocalMember().Name {
-			n.mu.Lock()
-			n.data[key] = value
-			n.mu.Unlock()
-			return nil
-		}
 	}
 
 	return fmt.Errorf("not responsible for this key")
@@ -183,4 +161,30 @@ func (n *DynamoNode) Close() error {
 	}
 
 	return n.rpcListener.Close()
+}
+
+func (n *DynamoNode) ClientGet(key []byte) ([]byte, error) {
+	args := &RPCArgs{
+		Key: key,
+	}
+	reply := &RPCReply{}
+
+	err := n.Get(args, reply)
+	if err != nil {
+		return nil, err
+	}
+
+	return reply.Value, nil
+}
+
+func (n *DynamoNode) ClientPut(key, value []byte) error {
+	args := &RPCArgs{Key: key, Value: value}
+	reply := &RPCReply{}
+
+	err := n.Put(args, reply)
+	if err != nil {
+		return err
+	}
+
+	return nil
 }
