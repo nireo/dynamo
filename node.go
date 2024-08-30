@@ -228,7 +228,7 @@ func (n *DynamoNode) Put(args *RPCArgs, reply *RPCReply) error {
 	}
 
 	successfulWrites := 0
-	newVersion := uint64(time.Now().Unix())
+	newVersion := uint64(time.Now().UnixNano())
 
 	for _, node := range closest {
 		// Write quorum is reached
