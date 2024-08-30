@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/rpc"
 	"sync"
+	"time"
 
 	"github.com/buraksezer/consistent"
 	"github.com/cespare/xxhash"
@@ -52,8 +53,9 @@ type DynamoNode struct {
 }
 
 type RPCArgs struct {
-	Key   []byte
-	Value []byte
+	Key     []byte
+	Value   []byte
+	Version uint64
 }
 
 type RPCReply struct {
@@ -220,17 +222,69 @@ func (n *DynamoNode) Get(args *RPCArgs, reply *RPCReply) error {
 }
 
 func (n *DynamoNode) Put(args *RPCArgs, reply *RPCReply) error {
-	owner := n.consistent.LocateKey(args.Key)
-
-	if owner.(MemberWrapper).Name == n.serfConf.NodeName {
-		n.mu.Lock()
-		defer n.mu.Unlock()
-
-		err := n.storage.Put(args.Key, args.Value)
+	closest, err := n.consistent.GetClosestN(args.Key, n.conf.N)
+	if err != nil {
 		return err
 	}
 
-	return n.forward("DynamoNode.Put", args, reply, owner.(MemberWrapper))
+	successfulWrites := 0
+	newVersion := uint64(time.Now().Unix())
+
+	for _, node := range closest {
+		// Write quorum is reached
+		if successfulWrites >= n.conf.W {
+			break
+		}
+
+		serfNode := node.(MemberWrapper)
+
+		if serfNode.Name == n.serfConf.NodeName {
+			err := n.storage.PutVersioned(args.Key, args.Value, newVersion)
+			if err != nil {
+				log.Printf("error putting key-value pair into local storage: %s", err)
+				continue
+			}
+			successfulWrites++
+			continue
+		}
+
+		client, err := rpc.Dial("tcp", serfNode.Tags["rpc_addr"])
+		if err != nil {
+			log.Printf("error dialing node %s due to error: %s", serfNode.Name, err)
+			continue
+		}
+
+		var rpcreply RPCReply
+		err = client.Call("DynamoNode.PutLocal", &RPCArgs{Key: args.Key, Value: args.Value, Version: newVersion}, &rpcreply)
+		if err != nil {
+			log.Printf("error calling node %s put local: %s", serfNode.Name, err)
+			continue
+		}
+
+		successfulWrites++
+	}
+
+	if successfulWrites < n.conf.W {
+		return ErrNotEnoughReplicas
+	}
+
+	reply.Version = newVersion
+	return nil
+}
+
+func (n *DynamoNode) PutLocal(args *RPCArgs, reply *RPCReply) error {
+	return n.storage.PutVersioned(args.Key, args.Value, args.Version)
+}
+
+func (n *DynamoNode) GetLocal(args *RPCArgs, reply *RPCReply) error {
+	value, version, err := n.storage.GetVersioned(args.Key)
+	if err != nil {
+		return err
+	}
+
+	reply.Value = value
+	reply.Version = version
+	return nil
 }
 
 func (n *DynamoNode) forward(method string, args *RPCArgs, reply *RPCReply, toSend MemberWrapper) error {
