@@ -1,6 +1,7 @@
 package dynamo
 
 import (
+	"errors"
 	"log"
 	"net"
 	"net/rpc"
@@ -10,6 +11,11 @@ import (
 	"github.com/cespare/xxhash"
 	"github.com/hashicorp/serf/serf"
 )
+
+// ErrNotEnoughReplicas happens when where trying to either will write or read quorums
+// and the amount of nodes is not enough to fullfill the configuration provided to the
+// node.
+var ErrNotEnoughReplicas = errors.New("not enough replicas for parameters")
 
 // MemberWrapper wraps serf.Member to implement consistent.Member interface
 type MemberWrapper struct {
@@ -51,7 +57,8 @@ type RPCArgs struct {
 }
 
 type RPCReply struct {
-	Value []byte
+	Value   []byte
+	Version uint64
 }
 
 func NewDynamoNode(config Config, bindAddr string, seeds []string, rpcAddr string) (*DynamoNode, error) {
@@ -150,21 +157,66 @@ func (n *DynamoNode) handleMemberLeave(event serf.MemberEvent) {
 }
 
 func (n *DynamoNode) Get(args *RPCArgs, reply *RPCReply) error {
-	owner := n.consistent.LocateKey(args.Key)
-	if owner.(MemberWrapper).Name == n.serfConf.NodeName {
-		n.mu.RLock()
-		defer n.mu.RUnlock()
-
-		val, err := n.storage.Get(args.Key)
-		if err != nil {
-			return err
-		}
-
-		reply.Value = val
-		return nil
+	closest, err := n.consistent.GetClosestN(args.Key, n.conf.N)
+	if err != nil {
+		return err
 	}
 
-	return n.forward("DynamoNode.Get", args, reply, owner.(MemberWrapper))
+	successfulReads := 0
+	var latestVersion uint64
+	var latestValue []byte
+
+	for _, node := range closest {
+		if successfulReads >= n.conf.R {
+			break
+		}
+
+		serfNode := node.(MemberWrapper)
+		if serfNode.Name == n.serfConf.NodeName {
+			// Should be read from local since it's this node
+			val, version, err := n.storage.GetVersioned(args.Key)
+			if err != nil {
+				log.Printf("error reading key from local node: %s", err)
+				continue
+			}
+
+			successfulReads++
+			if version > latestVersion {
+				latestValue = val
+				latestVersion = version
+			}
+			continue
+		}
+
+		client, err := rpc.Dial("tcp", serfNode.Tags["rpc_addr"])
+		if err != nil {
+			continue
+		}
+		defer client.Close()
+
+		var rpcreply RPCReply
+
+		err = client.Call("DynamoNode.GetLocal", args, &rpcreply)
+		if err != nil {
+			log.Printf("error reading from member node %s due to error: %s", serfNode.Name, err)
+			continue
+		}
+
+		successfulReads++
+		if rpcreply.Version > latestVersion {
+			latestValue = rpcreply.Value
+			latestVersion = rpcreply.Version
+		}
+	}
+
+	// Could not fill the read quorum
+	if successfulReads < n.conf.R {
+		return ErrNotEnoughReplicas
+	}
+
+	reply.Version = latestVersion
+	reply.Value = latestValue
+	return nil
 }
 
 func (n *DynamoNode) Put(args *RPCArgs, reply *RPCReply) error {
