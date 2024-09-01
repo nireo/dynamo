@@ -19,39 +19,60 @@ import (
 // node.
 var ErrNotEnoughReplicas = errors.New("not enough replicas for parameters")
 
-// MemberWrapper wraps serf.Member to implement consistent.Member interface
-type MemberWrapper struct {
+// Member wraps serf.Member to implement consistent.Member interface
+type Member struct {
 	serf.Member
 }
 
-func (m MemberWrapper) String() string {
+// String returns the name of the member.
+func (m Member) String() string {
 	return m.Name
 }
 
+// hasher implements the interface that is required by the buraksezer/consistent interface.
+// We choose xxhash in this implementation since it's one of the fastest hashing functions
+// implemented for Go.
 type hasher struct{}
 
 func (h hasher) Sum64(data []byte) uint64 {
 	return xxhash.Sum64(data)
 }
 
+// Config represents the configuration parameters for Amazon DynamoDB's consistency model.
+// These settings allow for fine-tuning the trade-offs between consistency, availability,
+// and partition tolerance (CAP theorem) in a distributed database system.
+//
+// DynamoDB uses these parameters to manage its replication strategy and determine
+// the behavior of read and write operations across multiple nodes. By adjusting
+// these values, users can optimize their DynamoDB setup for either stronger
+// consistency guarantees or higher availability, depending on their specific
+// application requirements.
+//
+// The relationship between N, R, and W influences the system's behavior:
+// - If R + W > N: The system favors strong consistency over availability.
+// - If R + W <= N: The system may return stale data in some scenarios, favoring availability.
+//
+// Typical DynamoDB deployments often use N=3 as a default replication factor.
 type Config struct {
-	N int
-	R int
-	W int
+	N int // The number of nodes that store replicas of data
+	R int // The number of nodes that must participate in a successful read operation
+	W int // The number of nodes that must participate in a successful write operation
 }
 
+// RpcClient defines the basic methods needed for RPC communication. This is used instead of
+// rpc.Client since this can be mocked easily and we can write tests easier.
 type RpcClient interface {
 	Call(serviceMethod string, args interface{}, reply interface{}) error
 	Close() error
 }
 
+// DynamoNode represents a physical node in the dynamo system.
 type DynamoNode struct {
 	conf           Config
 	serf           *serf.Serf
 	serfConf       *serf.Config
 	events         chan serf.Event
 	consistent     *consistent.Consistent
-	data           map[string]string // TODO: store data on disk
 	mu             sync.RWMutex
 	rpcServer      *rpc.Server
 	rpcListener    net.Listener
@@ -97,7 +118,6 @@ func NewDynamoNode(config Config, bindAddr string, seeds []string, rpcAddr strin
 	node := &DynamoNode{
 		conf:       config,
 		consistent: c,
-		data:       make(map[string]string),
 		events:     make(chan serf.Event),
 	}
 
@@ -132,7 +152,7 @@ func NewDynamoNode(config Config, bindAddr string, seeds []string, rpcAddr strin
 		return nil, err
 	}
 
-	node.consistent.Add(MemberWrapper{s.LocalMember()})
+	node.consistent.Add(Member{s.LocalMember()})
 
 	go node.rpcServer.Accept(node.rpcListener)
 	go node.eventHandler()
@@ -154,7 +174,7 @@ func (n *DynamoNode) eventHandler() {
 func (n *DynamoNode) handleMemberJoin(event serf.MemberEvent) {
 	for _, member := range event.Members {
 		log.Printf("member joined: %s", member.Name)
-		n.consistent.Add(MemberWrapper{member})
+		n.consistent.Add(Member{member})
 	}
 }
 
@@ -162,6 +182,15 @@ func (n *DynamoNode) handleMemberLeave(event serf.MemberEvent) {
 	for _, member := range event.Members {
 		log.Printf("member left or failed: %s", member.Name)
 		n.consistent.Remove(member.Name)
+
+		// Even though we don't automatically form the rpc connection we should still clean it up here.
+		addrToClean, err := getResolvedAddr(member.Tags["rpc_addr"])
+		if err != nil {
+			log.Printf("error resolving the address for addr %s: %s", member.Tags["rpc_addr"], err)
+			continue
+		}
+
+		delete(n.rpcConnections, addrToClean)
 	}
 }
 
@@ -180,7 +209,7 @@ func (n *DynamoNode) Get(args *RPCArgs, reply *RPCReply) error {
 			break
 		}
 
-		serfNode := node.(MemberWrapper)
+		serfNode := node.(Member)
 		if serfNode.Name == n.serfConf.NodeName {
 			// Should be read from local since it's this node
 			val, version, err := n.storage.GetVersioned(args.Key)
@@ -227,6 +256,11 @@ func (n *DynamoNode) Get(args *RPCArgs, reply *RPCReply) error {
 	return nil
 }
 
+// Put stores a key-value pair, implementing a quorum.
+// 1. Generate a new version number based on the current timestamp.
+// 2. Find the N closest nodes that should store the data (based on consistent hashing)
+// 3. Attempt to write to these nodes in parallel.
+// 4. If the write quorum is reached, consider the operation succesful.
 func (n *DynamoNode) Put(args *RPCArgs, reply *RPCReply) error {
 	closest, err := n.consistent.GetClosestN(args.Key, n.conf.N)
 	if err != nil {
@@ -236,15 +270,16 @@ func (n *DynamoNode) Put(args *RPCArgs, reply *RPCReply) error {
 	successfulWrites := 0
 	newVersion := uint64(time.Now().UnixNano())
 
+	// Attempt to write to nodes until we reach the write quorum or exhaust all nodes.
 	for _, node := range closest {
 		// Write quorum is reached
 		if successfulWrites >= n.conf.W {
 			break
 		}
 
-		serfNode := node.(MemberWrapper)
-
+		serfNode := node.(Member)
 		if serfNode.Name == n.serfConf.NodeName {
+			// Write to the local storage since it's this node.
 			err := n.storage.PutVersioned(args.Key, args.Value, newVersion)
 			if err != nil {
 				log.Printf("error putting key-value pair into local storage: %s", err)
@@ -254,6 +289,7 @@ func (n *DynamoNode) Put(args *RPCArgs, reply *RPCReply) error {
 			continue
 		}
 
+		// Need to write some other node that is not this node.
 		client, err := n.findClient(serfNode.Tags["rpc_addr"])
 		if err != nil {
 			log.Printf("error dialing node %s due to error: %s", serfNode.Name, err)
@@ -270,6 +306,7 @@ func (n *DynamoNode) Put(args *RPCArgs, reply *RPCReply) error {
 		successfulWrites++
 	}
 
+	// A put operation is only successful when the wanted write quorum is reached.
 	if successfulWrites < n.conf.W {
 		return ErrNotEnoughReplicas
 	}

@@ -75,7 +75,7 @@ func createTestDynamoNode(t *testing.T) (*DynamoNode, *MockStorageEngine, map[st
 
 	// Add test nodes to the consistent hash ring and create mock clients
 	for _, nodeName := range []string{"node1", "node2", "node3"} {
-		member := MemberWrapper{serf.Member{Name: nodeName, Tags: map[string]string{"rpc_addr": "127.0.0.1:800" + nodeName[4:]}}}
+		member := Member{serf.Member{Name: nodeName, Tags: map[string]string{"rpc_addr": "127.0.0.1:800" + nodeName[4:]}}}
 		node.consistent.Add(member)
 
 		if nodeName != "node1" { // node1 is the local node, so we don't need a mock client for it
