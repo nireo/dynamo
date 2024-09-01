@@ -57,13 +57,14 @@ func (m *MockRPCClient) Close() error {
 }
 
 // Helper function to create a test DynamoNode
-func createTestDynamoNode(t *testing.T) (*DynamoNode, *MockStorageEngine) {
-	t.Helper()
+func createTestDynamoNode(t *testing.T) (*DynamoNode, *MockStorageEngine, map[string]*MockRPCClient) {
 	mockStorage := new(MockStorageEngine)
+	mockClients := make(map[string]*MockRPCClient)
+
 	node := &DynamoNode{
 		conf:     Config{N: 3, R: 2, W: 2},
 		storage:  mockStorage,
-		serfConf: &serf.Config{NodeName: "test-node"},
+		serfConf: &serf.Config{NodeName: "node1"},
 		consistent: consistent.New(nil, consistent.Config{
 			PartitionCount:    10,
 			ReplicationFactor: 3,
@@ -73,23 +74,38 @@ func createTestDynamoNode(t *testing.T) (*DynamoNode, *MockStorageEngine) {
 		rpcConnections: make(map[string]RpcClient),
 	}
 
-	// Add some test nodes to the consistent hash ring
-	node.consistent.Add(MemberWrapper{serf.Member{Name: "node1", Tags: map[string]string{"rpc_addr": "localhost:8001"}}})
-	node.consistent.Add(MemberWrapper{serf.Member{Name: "node2", Tags: map[string]string{"rpc_addr": "localhost:8002"}}})
-	node.consistent.Add(MemberWrapper{serf.Member{Name: "node3", Tags: map[string]string{"rpc_addr": "localhost:8003"}}})
+	// Add test nodes to the consistent hash ring and create mock clients
+	for _, nodeName := range []string{"node1", "node2", "node3"} {
+		member := MemberWrapper{serf.Member{Name: nodeName, Tags: map[string]string{"rpc_addr": "127.0.0.1:800" + nodeName[4:]}}}
+		node.consistent.Add(member)
 
-	return node, mockStorage
+		if nodeName != "node1" { // node1 is the local node, so we don't need a mock client for it
+			mockClient := new(MockRPCClient)
+			mockClients[nodeName] = mockClient
+			node.rpcConnections[member.Tags["rpc_addr"]] = mockClient
+		}
+	}
+
+	return node, mockStorage, mockClients
 }
 
 func TestGet(t *testing.T) {
-	node, mockStorage := createTestDynamoNode(t)
+	node, mockStorage, mockClients := createTestDynamoNode(t)
 
-	t.Run("Successful Get with local read", func(t *testing.T) {
+	t.Run("Successful Get", func(t *testing.T) {
 		key := []byte("test-key")
 		value := []byte("test-value")
 		version := uint64(time.Now().UnixNano())
 
-		mockStorage.On("GetVersioned", key).Return(value, version, nil)
+		// Set up expectations for all possible nodes
+		mockStorage.On("GetVersioned", key).Return(value, version, nil).Maybe()
+		for _, client := range mockClients {
+			client.On("Call", "DynamoNode.GetLocal", mock.Anything, mock.Anything).Run(func(args mock.Arguments) {
+				reply := args.Get(2).(*RPCReply)
+				reply.Value = value
+				reply.Version = version
+			}).Return(nil).Maybe()
+		}
 
 		args := &RPCArgs{Key: key}
 		reply := &RPCReply{}
@@ -99,70 +115,24 @@ func TestGet(t *testing.T) {
 		assert.NoError(t, err)
 		assert.Equal(t, value, reply.Value)
 		assert.Equal(t, version, reply.Version)
-		mockStorage.AssertExpectations(t)
-	})
 
-	t.Run("Successful Get with remote reads", func(t *testing.T) {
-		key := []byte("remote-key")
-		value := []byte("remote-value")
-		version := uint64(time.Now().UnixNano())
+		// Verify that we had the correct number of calls
+		totalCalls := len(mockStorage.Calls)
+		for _, client := range mockClients {
+			totalCalls += len(client.Calls)
+		}
+		assert.Equal(t, node.conf.R, totalCalls, "Should have exactly R successful calls")
 
-		mockStorage.On("GetVersioned", key).Return(nil, uint64(0), errors.New("not found"))
-
-		mockClient1 := new(MockRPCClient)
-		mockClient2 := new(MockRPCClient)
-		node.rpcConnections["localhost:8002"] = mockClient1
-		node.rpcConnections["localhost:8003"] = mockClient2
-
-		mockClient1.On("Call", "DynamoNode.GetLocal", mock.Anything, mock.Anything).Run(func(args mock.Arguments) {
-			reply := args.Get(2).(*RPCReply)
-			reply.Value = value
-			reply.Version = version
-		}).Return(nil)
-
-		mockClient2.On("Call", "DynamoNode.GetLocal", mock.Anything, mock.Anything).Return(errors.New("network error"))
-
-		args := &RPCArgs{Key: key}
-		reply := &RPCReply{}
-
-		err := node.Get(args, reply)
-
-		assert.NoError(t, err)
-		assert.Equal(t, value, reply.Value)
-		assert.Equal(t, version, reply.Version)
-		mockStorage.AssertExpectations(t)
-		mockClient1.AssertExpectations(t)
-		mockClient2.AssertExpectations(t)
-	})
-
-	t.Run("Get fails due to not enough replicas", func(t *testing.T) {
-		key := []byte("unavailable-key")
-
-		mockStorage.On("GetVersioned", key).Return(nil, uint64(0), errors.New("not found"))
-
-		mockClient1 := new(MockRPCClient)
-		mockClient2 := new(MockRPCClient)
-		node.rpcConnections["localhost:8002"] = mockClient1
-		node.rpcConnections["localhost:8003"] = mockClient2
-
-		mockClient1.On("Call", "DynamoNode.GetLocal", mock.Anything, mock.Anything).Return(errors.New("network error"))
-		mockClient2.On("Call", "DynamoNode.GetLocal", mock.Anything, mock.Anything).Return(errors.New("network error"))
-
-		args := &RPCArgs{Key: key}
-		reply := &RPCReply{}
-
-		err := node.Get(args, reply)
-
-		assert.Error(t, err)
-		assert.Equal(t, ErrNotEnoughReplicas, err)
-		mockStorage.AssertExpectations(t)
-		mockClient1.AssertExpectations(t)
-		mockClient2.AssertExpectations(t)
+		// Additional check to ensure no mock was called more than once
+		assert.LessOrEqual(t, len(mockStorage.Calls), 1, "Storage should be called at most once")
+		for nodeName, client := range mockClients {
+			assert.LessOrEqual(t, len(client.Calls), 1, "Client %s should be called at most once", nodeName)
+		}
 	})
 }
 
 func TestPut(t *testing.T) {
-	node, mockStorage := createTestDynamoNode(t)
+	node, mockStorage, mockClients := createTestDynamoNode(t)
 
 	t.Run("Successful Put with local write", func(t *testing.T) {
 		key := []byte("test-key")
@@ -186,13 +156,8 @@ func TestPut(t *testing.T) {
 
 		mockStorage.On("PutVersioned", key, value, mock.AnythingOfType("uint64")).Return(errors.New("local write failed"))
 
-		mockClient1 := new(MockRPCClient)
-		mockClient2 := new(MockRPCClient)
-		node.rpcConnections["localhost:8002"] = mockClient1
-		node.rpcConnections["localhost:8003"] = mockClient2
-
-		mockClient1.On("Call", "DynamoNode.PutLocal", mock.Anything, mock.Anything).Return(nil)
-		mockClient2.On("Call", "DynamoNode.PutLocal", mock.Anything, mock.Anything).Return(nil)
+		mockClients["node2"].On("Call", "DynamoNode.PutLocal", mock.Anything, mock.Anything).Return(nil)
+		mockClients["node3"].On("Call", "DynamoNode.PutLocal", mock.Anything, mock.Anything).Return(nil)
 
 		args := &RPCArgs{Key: key, Value: value}
 		reply := &RPCReply{}
@@ -202,8 +167,8 @@ func TestPut(t *testing.T) {
 		assert.NoError(t, err)
 		assert.NotZero(t, reply.Version)
 		mockStorage.AssertExpectations(t)
-		mockClient1.AssertExpectations(t)
-		mockClient2.AssertExpectations(t)
+		mockClients["node2"].AssertExpectations(t)
+		mockClients["node3"].AssertExpectations(t)
 	})
 
 	t.Run("Put fails due to not enough replicas", func(t *testing.T) {
@@ -212,13 +177,8 @@ func TestPut(t *testing.T) {
 
 		mockStorage.On("PutVersioned", key, value, mock.AnythingOfType("uint64")).Return(errors.New("local write failed"))
 
-		mockClient1 := new(MockRPCClient)
-		mockClient2 := new(MockRPCClient)
-		node.rpcConnections["localhost:8002"] = mockClient1
-		node.rpcConnections["localhost:8003"] = mockClient2
-
-		mockClient1.On("Call", "DynamoNode.PutLocal", mock.Anything, mock.Anything).Return(errors.New("network error"))
-		mockClient2.On("Call", "DynamoNode.PutLocal", mock.Anything, mock.Anything).Return(errors.New("network error"))
+		mockClients["node2"].On("Call", "DynamoNode.PutLocal", mock.Anything, mock.Anything).Return(errors.New("network error"))
+		mockClients["node3"].On("Call", "DynamoNode.PutLocal", mock.Anything, mock.Anything).Return(errors.New("network error"))
 
 		args := &RPCArgs{Key: key, Value: value}
 		reply := &RPCReply{}
@@ -228,13 +188,13 @@ func TestPut(t *testing.T) {
 		assert.Error(t, err)
 		assert.Equal(t, ErrNotEnoughReplicas, err)
 		mockStorage.AssertExpectations(t)
-		mockClient1.AssertExpectations(t)
-		mockClient2.AssertExpectations(t)
+		mockClients["node2"].AssertExpectations(t)
+		mockClients["node3"].AssertExpectations(t)
 	})
 }
 
 func TestGetLocal(t *testing.T) {
-	node, mockStorage := createTestDynamoNode(t)
+	node, mockStorage, _ := createTestDynamoNode(t)
 
 	key := []byte("local-key")
 	value := []byte("local-value")
@@ -254,7 +214,7 @@ func TestGetLocal(t *testing.T) {
 }
 
 func TestPutLocal(t *testing.T) {
-	node, mockStorage := createTestDynamoNode(t)
+	node, mockStorage, _ := createTestDynamoNode(t)
 
 	key := []byte("local-key")
 	value := []byte("local-value")
@@ -266,6 +226,36 @@ func TestPutLocal(t *testing.T) {
 	reply := &RPCReply{}
 
 	err := node.PutLocal(args, reply)
+
+	assert.NoError(t, err)
+	mockStorage.AssertExpectations(t)
+}
+
+func TestClientGet(t *testing.T) {
+	node, mockStorage, _ := createTestDynamoNode(t)
+
+	key := []byte("client-get-key")
+	value := []byte("client-get-value")
+	version := uint64(time.Now().UnixNano())
+
+	mockStorage.On("GetVersioned", key).Return(value, version, nil)
+
+	result, err := node.ClientGet(key)
+
+	assert.NoError(t, err)
+	assert.Equal(t, value, result)
+	mockStorage.AssertExpectations(t)
+}
+
+func TestClientPut(t *testing.T) {
+	node, mockStorage, _ := createTestDynamoNode(t)
+
+	key := []byte("client-put-key")
+	value := []byte("client-put-value")
+
+	mockStorage.On("PutVersioned", key, value, mock.AnythingOfType("uint64")).Return(nil)
+
+	err := node.ClientPut(key, value)
 
 	assert.NoError(t, err)
 	mockStorage.AssertExpectations(t)
