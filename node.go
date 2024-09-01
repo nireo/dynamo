@@ -7,7 +7,6 @@ import (
 	"net"
 	"net/rpc"
 	"sync"
-	"time"
 
 	"github.com/buraksezer/consistent"
 	"github.com/cespare/xxhash"
@@ -81,14 +80,14 @@ type DynamoNode struct {
 }
 
 type RPCArgs struct {
-	Key     []byte
-	Value   []byte
-	Version uint64
+	Key   []byte
+	Value []byte
+	Clock *VectorClock
 }
 
 type RPCReply struct {
-	Value   []byte
-	Version uint64
+	Value []byte
+	Clock *VectorClock
 }
 
 func NewDynamoNode(config Config, bindAddr string, seeds []string, rpcAddr string) (*DynamoNode, error) {
@@ -201,7 +200,7 @@ func (n *DynamoNode) Get(args *RPCArgs, reply *RPCReply) error {
 	}
 
 	successfulReads := 0
-	var latestVersion uint64
+	var latestClock *VectorClock
 	var latestValue []byte
 
 	for _, node := range closest {
@@ -212,16 +211,16 @@ func (n *DynamoNode) Get(args *RPCArgs, reply *RPCReply) error {
 		serfNode := node.(Member)
 		if serfNode.Name == n.serfConf.NodeName {
 			// Should be read from local since it's this node
-			val, version, err := n.storage.GetVersioned(args.Key)
+			val, clock, err := n.storage.GetVersioned(args.Key)
 			if err != nil {
 				log.Printf("error reading key from local node: %s", err)
 				continue
 			}
 
 			successfulReads++
-			if version > latestVersion {
+			if latestClock == nil || clock.Compare(latestClock) > 0 {
+				latestClock = clock
 				latestValue = val
-				latestVersion = version
 			}
 			continue
 		}
@@ -240,9 +239,9 @@ func (n *DynamoNode) Get(args *RPCArgs, reply *RPCReply) error {
 		}
 
 		successfulReads++
-		if rpcreply.Version > latestVersion {
+		if latestClock == nil || rpcreply.Clock.Compare(latestClock) > 0 {
 			latestValue = rpcreply.Value
-			latestVersion = rpcreply.Version
+			latestClock = rpcreply.Clock
 		}
 	}
 
@@ -251,7 +250,7 @@ func (n *DynamoNode) Get(args *RPCArgs, reply *RPCReply) error {
 		return ErrNotEnoughReplicas
 	}
 
-	reply.Version = latestVersion
+	reply.Clock = latestClock
 	reply.Value = latestValue
 	return nil
 }
@@ -268,7 +267,12 @@ func (n *DynamoNode) Put(args *RPCArgs, reply *RPCReply) error {
 	}
 
 	successfulWrites := 0
-	newVersion := uint64(time.Now().UnixNano())
+	newClock := NewVectorClock()
+	newClock.Increment(n.serfConf.NodeName)
+
+	if args.Clock != nil {
+		newClock.Merge(args.Clock)
+	}
 
 	// Attempt to write to nodes until we reach the write quorum or exhaust all nodes.
 	for _, node := range closest {
@@ -280,7 +284,7 @@ func (n *DynamoNode) Put(args *RPCArgs, reply *RPCReply) error {
 		serfNode := node.(Member)
 		if serfNode.Name == n.serfConf.NodeName {
 			// Write to the local storage since it's this node.
-			err := n.storage.PutVersioned(args.Key, args.Value, newVersion)
+			err := n.storage.PutVersioned(args.Key, args.Value, newClock)
 			if err != nil {
 				log.Printf("error putting key-value pair into local storage: %s", err)
 				continue
@@ -297,7 +301,7 @@ func (n *DynamoNode) Put(args *RPCArgs, reply *RPCReply) error {
 		}
 
 		var rpcreply RPCReply
-		err = client.Call("DynamoNode.PutLocal", &RPCArgs{Key: args.Key, Value: args.Value, Version: newVersion}, &rpcreply)
+		err = client.Call("DynamoNode.PutLocal", &RPCArgs{Key: args.Key, Value: args.Value, Clock: newClock}, &rpcreply)
 		if err != nil {
 			log.Printf("error calling node %s put local: %s", serfNode.Name, err)
 			continue
@@ -311,22 +315,22 @@ func (n *DynamoNode) Put(args *RPCArgs, reply *RPCReply) error {
 		return ErrNotEnoughReplicas
 	}
 
-	reply.Version = newVersion
+	reply.Clock = newClock
 	return nil
 }
 
 func (n *DynamoNode) PutLocal(args *RPCArgs, reply *RPCReply) error {
-	return n.storage.PutVersioned(args.Key, args.Value, args.Version)
+	return n.storage.PutVersioned(args.Key, args.Value, args.Clock)
 }
 
 func (n *DynamoNode) GetLocal(args *RPCArgs, reply *RPCReply) error {
-	value, version, err := n.storage.GetVersioned(args.Key)
+	value, clock, err := n.storage.GetVersioned(args.Key)
 	if err != nil {
 		return err
 	}
 
 	reply.Value = value
-	reply.Version = version
+	reply.Clock = clock
 	return nil
 }
 

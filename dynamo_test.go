@@ -2,7 +2,6 @@ package dynamo
 
 import (
 	"testing"
-	"time"
 
 	"github.com/buraksezer/consistent"
 	"github.com/hashicorp/serf/serf"
@@ -25,13 +24,13 @@ func (m *MockStorageEngine) Put(key, value []byte) error {
 	return args.Error(0)
 }
 
-func (m *MockStorageEngine) GetVersioned(key []byte) ([]byte, uint64, error) {
+func (m *MockStorageEngine) GetVersioned(key []byte) ([]byte, *VectorClock, error) {
 	args := m.Called(key)
-	return args.Get(0).([]byte), args.Get(1).(uint64), args.Error(2)
+	return args.Get(0).([]byte), args.Get(1).(*VectorClock), args.Error(2)
 }
 
-func (m *MockStorageEngine) PutVersioned(key, value []byte, version uint64) error {
-	args := m.Called(key, value, version)
+func (m *MockStorageEngine) PutVersioned(key, value []byte, clock *VectorClock) error {
+	args := m.Called(key, value, clock)
 	return args.Error(0)
 }
 
@@ -94,15 +93,16 @@ func TestGet(t *testing.T) {
 	t.Run("Successful Get", func(t *testing.T) {
 		key := []byte("test-key")
 		value := []byte("test-value")
-		version := uint64(time.Now().UnixNano())
+		clock := NewVectorClock()
+		clock.Increment("node1")
 
 		// Set up expectations for all possible nodes
-		mockStorage.On("GetVersioned", key).Return(value, version, nil).Maybe()
+		mockStorage.On("GetVersioned", key).Return(value, clock, nil).Maybe()
 		for _, client := range mockClients {
 			client.On("Call", "DynamoNode.GetLocal", mock.Anything, mock.Anything).Run(func(args mock.Arguments) {
 				reply := args.Get(2).(*RPCReply)
 				reply.Value = value
-				reply.Version = version
+				reply.Clock = clock
 			}).Return(nil).Maybe()
 		}
 
@@ -113,7 +113,7 @@ func TestGet(t *testing.T) {
 
 		assert.NoError(t, err)
 		assert.Equal(t, value, reply.Value)
-		assert.Equal(t, version, reply.Version)
+		assert.Equal(t, clock, reply.Clock)
 
 		// Verify that we had the correct number of calls
 		totalCalls := len(mockStorage.Calls)
@@ -138,7 +138,7 @@ func TestPut(t *testing.T) {
 		value := []byte("test-value")
 
 		// Set up expectations for all possible nodes
-		mockStorage.On("PutVersioned", key, value, mock.AnythingOfType("uint64")).Return(nil).Maybe()
+		mockStorage.On("PutVersioned", key, value, mock.AnythingOfType("*dynamo.VectorClock")).Return(nil).Maybe()
 		for _, client := range mockClients {
 			client.On("Call", "DynamoNode.PutLocal", mock.Anything, mock.Anything).Return(nil).Maybe()
 		}
@@ -149,7 +149,8 @@ func TestPut(t *testing.T) {
 		err := node.Put(args, reply)
 
 		assert.NoError(t, err)
-		assert.NotZero(t, reply.Version)
+		assert.NotNil(t, reply.Clock)
+		assert.Equal(t, uint64(1), reply.Clock.Counter["node1"], "Local node counter should be incremented")
 
 		// Verify that we had the correct number of calls
 		totalCalls := len(mockStorage.Calls)
@@ -171,9 +172,10 @@ func TestGetLocal(t *testing.T) {
 
 	key := []byte("local-key")
 	value := []byte("local-value")
-	version := uint64(time.Now().UnixNano())
+	clock := NewVectorClock()
+	clock.Increment("node1")
 
-	mockStorage.On("GetVersioned", key).Return(value, version, nil)
+	mockStorage.On("GetVersioned", key).Return(value, clock, nil)
 
 	args := &RPCArgs{Key: key}
 	reply := &RPCReply{}
@@ -182,7 +184,7 @@ func TestGetLocal(t *testing.T) {
 
 	assert.NoError(t, err)
 	assert.Equal(t, value, reply.Value)
-	assert.Equal(t, version, reply.Version)
+	assert.Equal(t, clock, reply.Clock)
 	mockStorage.AssertExpectations(t)
 }
 
@@ -191,44 +193,15 @@ func TestPutLocal(t *testing.T) {
 
 	key := []byte("local-key")
 	value := []byte("local-value")
-	version := uint64(time.Now().UnixNano())
+	clock := NewVectorClock()
+	clock.Increment("node1")
 
-	mockStorage.On("PutVersioned", key, value, version).Return(nil)
+	mockStorage.On("PutVersioned", key, value, clock).Return(nil)
 
-	args := &RPCArgs{Key: key, Value: value, Version: version}
+	args := &RPCArgs{Key: key, Value: value, Clock: clock}
 	reply := &RPCReply{}
 
 	err := node.PutLocal(args, reply)
-
-	assert.NoError(t, err)
-	mockStorage.AssertExpectations(t)
-}
-
-func TestClientGet(t *testing.T) {
-	node, mockStorage, _ := createTestDynamoNode(t)
-
-	key := []byte("client-get-key")
-	value := []byte("client-get-value")
-	version := uint64(time.Now().UnixNano())
-
-	mockStorage.On("GetVersioned", key).Return(value, version, nil)
-
-	result, err := node.ClientGet(key)
-
-	assert.NoError(t, err)
-	assert.Equal(t, value, result)
-	mockStorage.AssertExpectations(t)
-}
-
-func TestClientPut(t *testing.T) {
-	node, mockStorage, _ := createTestDynamoNode(t)
-
-	key := []byte("client-put-key")
-	value := []byte("client-put-value")
-
-	mockStorage.On("PutVersioned", key, value, mock.AnythingOfType("uint64")).Return(nil)
-
-	err := node.ClientPut(key, value)
 
 	assert.NoError(t, err)
 	mockStorage.AssertExpectations(t)

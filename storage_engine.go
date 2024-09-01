@@ -18,12 +18,12 @@ type StorageEngine interface {
 	// GetVersioned is an extension of the Get method where the version metadata is read from the
 	// value before returned. NOTE: That GetVersioned should only be used to read items that are
 	// inserted using PutVersioned
-	GetVersioned(key []byte) ([]byte, uint64, error)
+	GetVersioned(key []byte) ([]byte, *VectorClock, error)
 
 	// PutVersioned writes a given key value pair and adds a version at the start of the value that
 	// is then written into the data store. NOTE: This value should only be read by using GetVersioned
 	// otherwise this will cause problems.
-	PutVersioned(key, value []byte, version uint64) error
+	PutVersioned(key, value []byte, vectorClock *VectorClock) error
 
 	// Close clear out any left over resources etc if those need to be cleared
 	Close() error
@@ -70,22 +70,31 @@ func (b *BadgerStorage) Put(key, value []byte) error {
 }
 
 // GetVersioned -- see interface documentation
-func (b *BadgerStorage) GetVersioned(key []byte) ([]byte, uint64, error) {
+func (b *BadgerStorage) GetVersioned(key []byte) ([]byte, *VectorClock, error) {
 	val, err := b.Get(key)
 	if err != nil {
-		return nil, 0, err
+		return nil, nil, err
 	}
 
-	version := binary.LittleEndian.Uint64(val[:8])
-	return val[8:], version, nil
+	vclen := binary.LittleEndian.Uint64(val[:8])
+	vcdata := val[8 : 8+vclen]
+
+	vc := NewVectorClock()
+	if err := vc.Deserialize(vcdata); err != nil {
+		return nil, nil, err
+	}
+	return val[8+vclen:], vc, nil
 }
 
-// PutVersioned -- see interface documentation
-func (b *BadgerStorage) PutVersioned(key, value []byte, version uint64) error {
-	newVal := make([]byte, 8)
-	binary.LittleEndian.PutUint64(newVal, version)
+// PutVersioned stores a key-value pair with a vector clock
+func (b *BadgerStorage) PutVersioned(key, value []byte, vc *VectorClock) error {
+	vcData := vc.Serialize()
+	vcLen := len(vcData)
 
-	newVal = append(newVal, value...)
+	newVal := make([]byte, 8+vcLen+len(value))
+	binary.LittleEndian.PutUint64(newVal, uint64(vcLen))
+	copy(newVal[8:], vcData)
+	copy(newVal[8+vcLen:], value)
 
 	return b.Put(key, newVal)
 }
