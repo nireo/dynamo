@@ -2,6 +2,7 @@ package dynamo
 
 import (
 	"errors"
+	"fmt"
 	"log"
 	"net"
 	"net/rpc"
@@ -39,17 +40,23 @@ type Config struct {
 	W int
 }
 
+type RpcClient interface {
+	Call(serviceMethod string, args interface{}, reply interface{}) error
+	Close() error
+}
+
 type DynamoNode struct {
-	conf        Config
-	serf        *serf.Serf
-	serfConf    *serf.Config
-	events      chan serf.Event
-	consistent  *consistent.Consistent
-	data        map[string]string // TODO: store data on disk
-	mu          sync.RWMutex
-	rpcServer   *rpc.Server
-	rpcListener net.Listener
-	storage     StorageEngine
+	conf           Config
+	serf           *serf.Serf
+	serfConf       *serf.Config
+	events         chan serf.Event
+	consistent     *consistent.Consistent
+	data           map[string]string // TODO: store data on disk
+	mu             sync.RWMutex
+	rpcServer      *rpc.Server
+	rpcListener    net.Listener
+	storage        StorageEngine
+	rpcConnections map[string]RpcClient
 }
 
 type RPCArgs struct {
@@ -190,14 +197,13 @@ func (n *DynamoNode) Get(args *RPCArgs, reply *RPCReply) error {
 			continue
 		}
 
-		client, err := rpc.Dial("tcp", serfNode.Tags["rpc_addr"])
+		client, err := n.findClient(serfNode.Tags["rpc_addr"])
 		if err != nil {
+			log.Printf("failed to find client for addr %s, got err: %s", serfNode.Tags["rpc_addr"], err)
 			continue
 		}
-		defer client.Close()
 
 		var rpcreply RPCReply
-
 		err = client.Call("DynamoNode.GetLocal", args, &rpcreply)
 		if err != nil {
 			log.Printf("error reading from member node %s due to error: %s", serfNode.Name, err)
@@ -248,7 +254,7 @@ func (n *DynamoNode) Put(args *RPCArgs, reply *RPCReply) error {
 			continue
 		}
 
-		client, err := rpc.Dial("tcp", serfNode.Tags["rpc_addr"])
+		client, err := n.findClient(serfNode.Tags["rpc_addr"])
 		if err != nil {
 			log.Printf("error dialing node %s due to error: %s", serfNode.Name, err)
 			continue
@@ -287,19 +293,48 @@ func (n *DynamoNode) GetLocal(args *RPCArgs, reply *RPCReply) error {
 	return nil
 }
 
-func (n *DynamoNode) forward(method string, args *RPCArgs, reply *RPCReply, toSend MemberWrapper) error {
-	client, err := rpc.Dial("tcp", toSend.Tags["rpc_addr"])
+func getResolvedAddr(rpcAddr string) (string, error) {
+	// Since string matching is quite bad in terms of addresses resolve the addr and use the ip and port.
+	addr, err := net.ResolveTCPAddr("tcp", rpcAddr)
 	if err != nil {
-		return err
+		return "", err
 	}
-	defer client.Close()
 
-	return client.Call(method, args, reply)
+	return fmt.Sprintf("%s:%d", addr.IP.String(), addr.Port), nil
+}
+
+// findClient finds a given client from a list of rpcClients if it doesn't find that it tries
+// connection to the correct node.
+func (n *DynamoNode) findClient(rpcAddr string) (RpcClient, error) {
+	var err error
+	rpcAddr, err = getResolvedAddr(rpcAddr)
+	if err != nil {
+		return nil, err
+	}
+
+	client, ok := n.rpcConnections[rpcAddr]
+	if ok {
+		return client, nil
+	}
+
+	client, err = rpc.Dial("tcp", rpcAddr)
+	if err != nil {
+		return nil, err
+	}
+
+	n.rpcConnections[rpcAddr] = client
+	return client, nil
 }
 
 func (n *DynamoNode) Close() error {
 	if err := n.serf.Leave(); err != nil {
 		return err
+	}
+
+	for _, client := range n.rpcConnections {
+		if err := client.Close(); err != nil {
+			return err
+		}
 	}
 
 	return n.rpcListener.Close()
