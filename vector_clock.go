@@ -7,6 +7,8 @@ import (
 	"sync"
 )
 
+// A simple implementation of a vector clock. TODO: implement compression
+
 // VectorClock represents the vector clock for a particular value.
 type VectorClock struct {
 	Counter map[string]uint64
@@ -40,6 +42,10 @@ func (vc *VectorClock) Merge(other *VectorClock) {
 	}
 }
 
+// Compare compares this VectorClock with another vector clock
+// -1 if this clock is less than the other
+// 0 if they are qual or concurrent
+// 1 if this clock is greater than the other
 func (vc *VectorClock) Compare(other *VectorClock) int {
 	vc.mu.Lock()
 	defer vc.mu.Unlock()
@@ -73,6 +79,8 @@ func (vc *VectorClock) Compare(other *VectorClock) int {
 	return 0 // Equal or concurrent
 }
 
+// Serialize convers the VectorClock to a byte slice.
+// Format is: [length of nodeID (8 bytes)][nodeID][count (8 bytes)] for each entry
 func (vc *VectorClock) Serialize() []byte {
 	totalSize := 0
 	for nodeID, _ := range vc.Counter {
@@ -96,6 +104,8 @@ func (vc *VectorClock) Serialize() []byte {
 	return res
 }
 
+// Deserialize reads a given byte array and creates and fill the VectorClock
+// from that.
 func (vc *VectorClock) Deserialize(data []byte) error {
 	vc.Counter = make(map[string]uint64)
 	reader := bytes.NewReader(data)
@@ -122,6 +132,7 @@ func (vc *VectorClock) Deserialize(data []byte) error {
 	return nil
 }
 
+// Copy creates a deep copy of a given VectorClock
 func (vc *VectorClock) Copy() *VectorClock {
 	newVC := NewVectorClock()
 	for k, v := range vc.Counter {
@@ -130,13 +141,17 @@ func (vc *VectorClock) Copy() *VectorClock {
 	return newVC
 }
 
+// Versionedvalue represents a value with its associated VectorClock
 type VersionedValue struct {
 	Value []byte
 	Clock *VectorClock
 }
 
+// ConflictSet is a slice of Versionedvalues, representing conflicting versions.
 type ConflictSet []VersionedValue
 
+// Resolve attemps to resolve conflicts in the ConflictSet
+// It returns the resolved VersionValue and a boolean indicating if resolution was succesful.
 func (cs ConflictSet) Resolve() (VersionedValue, bool) {
 	// base cases
 	if len(cs) == 0 {

@@ -61,7 +61,7 @@ func createTestDynamoNode(t *testing.T) (*DynamoNode, *MockStorageEngine, map[st
 
 	node := &DynamoNode{
 		conf:     Config{N: 3, R: 2, W: 2},
-		storage:  mockStorage,
+		Storage:  mockStorage,
 		serfConf: &serf.Config{NodeName: "node1"},
 		consistent: consistent.New(nil, consistent.Config{
 			PartitionCount:    10,

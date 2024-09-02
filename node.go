@@ -75,7 +75,7 @@ type DynamoNode struct {
 	mu             sync.RWMutex
 	rpcServer      *rpc.Server
 	rpcListener    net.Listener
-	storage        StorageEngine
+	Storage        StorageEngine
 	rpcConnections map[string]RpcClient
 }
 
@@ -211,7 +211,7 @@ func (n *DynamoNode) Get(args *RPCArgs, reply *RPCReply) error {
 		serfNode := node.(Member)
 		if serfNode.Name == n.serfConf.NodeName {
 			// Should be read from local since it's this node
-			val, clock, err := n.storage.GetVersioned(args.Key)
+			val, clock, err := n.Storage.GetVersioned(args.Key)
 			if err != nil {
 				log.Printf("error reading key from local node: %s", err)
 				continue
@@ -284,7 +284,7 @@ func (n *DynamoNode) Put(args *RPCArgs, reply *RPCReply) error {
 		serfNode := node.(Member)
 		if serfNode.Name == n.serfConf.NodeName {
 			// Write to the local storage since it's this node.
-			err := n.storage.PutVersioned(args.Key, args.Value, newClock)
+			err := n.Storage.PutVersioned(args.Key, args.Value, newClock)
 			if err != nil {
 				log.Printf("error putting key-value pair into local storage: %s", err)
 				continue
@@ -320,11 +320,11 @@ func (n *DynamoNode) Put(args *RPCArgs, reply *RPCReply) error {
 }
 
 func (n *DynamoNode) PutLocal(args *RPCArgs, reply *RPCReply) error {
-	return n.storage.PutVersioned(args.Key, args.Value, args.Clock)
+	return n.Storage.PutVersioned(args.Key, args.Value, args.Clock)
 }
 
 func (n *DynamoNode) GetLocal(args *RPCArgs, reply *RPCReply) error {
-	value, clock, err := n.storage.GetVersioned(args.Key)
+	value, clock, err := n.Storage.GetVersioned(args.Key)
 	if err != nil {
 		return err
 	}
