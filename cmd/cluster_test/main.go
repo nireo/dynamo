@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -14,52 +15,80 @@ import (
 	"github.com/nireo/dynamo"
 )
 
-const (
-	baseBindPort = 7946
-	baseRPCPort  = 8000
-)
-
 func main() {
-	numNodes := flag.Int("nodes", 3, "number of nodes to start")
-	numPairs := flag.Int("pairs", 100, "number of key-value pairs to insert")
+	numNodes := flag.Int("nodes", 3, "Number of nodes to start")
+	numPairs := flag.Int("pairs", 100, "Number of key-value pairs to insert")
 	flag.Parse()
 
+	// Create a temporary directory for node data
 	tempDir, err := os.MkdirTemp("", "dynamo-test")
 	if err != nil {
-		log.Fatalf("failed to create temp dir: %v", err)
+		log.Fatalf("Failed to create temp directory: %v", err)
 	}
 	defer os.RemoveAll(tempDir)
 
 	// Start the nodes
-	nodes := startNodes(*numNodes, tempDir)
+	nodes, ports := startNodes(*numNodes, tempDir)
 	defer stopNodes(nodes)
 
 	// Wait for the cluster to stabilize
 	time.Sleep(5 * time.Second)
 
 	// Test inserting key-value pairs
-	testInsertPairs(nodes[0], *numPairs)
+	testInsertPairs(ports[0].rpcPort, *numPairs)
 
 	// Test reading key-value pairs
-	testReadPairs(nodes[0], *numPairs)
+	testReadPairs(ports[0].rpcPort, *numPairs)
 
 	fmt.Println("All tests completed successfully!")
 }
 
-func startNodes(n int, tempDir string) []*exec.Cmd {
+type nodePorts struct {
+	bindPort int
+	rpcPort  int
+}
+
+func getFreePorts(count int) ([]int, error) {
+	ports := make([]int, 0, count)
+	for i := 0; i < count; i++ {
+		addr, err := net.ResolveTCPAddr("tcp", "localhost:0")
+		if err != nil {
+			return nil, err
+		}
+
+		l, err := net.ListenTCP("tcp", addr)
+		if err != nil {
+			return nil, err
+		}
+		defer l.Close()
+		ports = append(ports, l.Addr().(*net.TCPAddr).Port)
+	}
+	return ports, nil
+}
+
+func startNodes(n int, tempDir string) ([]*exec.Cmd, []nodePorts) {
 	var nodes []*exec.Cmd
+	var ports []nodePorts
 	var seeds []string
 
 	for i := 0; i < n; i++ {
-		bindAddr := fmt.Sprintf("127.0.0.1:%d", baseBindPort+i)
-		rpcAddr := fmt.Sprintf("127.0.0.1:%d", baseRPCPort+i)
+		freePorts, err := getFreePorts(2)
+		if err != nil {
+			log.Fatalf("Failed to get free ports: %v", err)
+		}
+
+		bindPort := freePorts[0]
+		rpcPort := freePorts[1]
+
+		bindAddr := fmt.Sprintf("127.0.0.1:%d", bindPort)
+		rpcAddr := fmt.Sprintf("127.0.0.1:%d", rpcPort)
 		storePath := filepath.Join(tempDir, fmt.Sprintf("node%d", i))
 
 		if i > 0 {
-			seeds = append(seeds, fmt.Sprintf("127.0.0.1:%d", baseBindPort))
+			seeds = append(seeds, fmt.Sprintf("127.0.0.1:%d", ports[0].bindPort))
 		}
 
-		cmd := exec.Command("./dynamonode",
+		cmd := exec.Command("./node",
 			"-bind", bindAddr,
 			"-rpc", rpcAddr,
 			"-store", storePath,
@@ -73,10 +102,11 @@ func startNodes(n int, tempDir string) []*exec.Cmd {
 		}
 
 		nodes = append(nodes, cmd)
+		ports = append(ports, nodePorts{bindPort: bindPort, rpcPort: rpcPort})
 		fmt.Printf("Started node %d: Bind=%s, RPC=%s\n", i, bindAddr, rpcAddr)
 	}
 
-	return nodes
+	return nodes, ports
 }
 
 func stopNodes(nodes []*exec.Cmd) {
@@ -93,8 +123,8 @@ func stopNodes(nodes []*exec.Cmd) {
 	}
 }
 
-func testInsertPairs(node *exec.Cmd, numPairs int) {
-	client, err := createClient(fmt.Sprintf("127.0.0.1:%d", baseRPCPort))
+func testInsertPairs(rpcPort int, numPairs int) {
+	client, err := createClient(fmt.Sprintf("127.0.0.1:%d", rpcPort))
 	if err != nil {
 		log.Fatalf("Failed to create client: %v", err)
 	}
@@ -119,8 +149,8 @@ func testInsertPairs(node *exec.Cmd, numPairs int) {
 	fmt.Printf("Inserted %d key-value pairs\n", numPairs)
 }
 
-func testReadPairs(node *exec.Cmd, numPairs int) {
-	client, err := createClient(fmt.Sprintf("127.0.0.1:%d", baseRPCPort))
+func testReadPairs(rpcPort int, numPairs int) {
+	client, err := createClient(fmt.Sprintf("127.0.0.1:%d", rpcPort))
 	if err != nil {
 		log.Fatalf("Failed to create client: %v", err)
 	}
